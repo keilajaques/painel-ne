@@ -612,41 +612,76 @@ async function updateDueDate(cardId, isoDate){
 /* ============================================================
    SYNC — 5 tipos em paralelo
    ============================================================ */
-const TIPOS_CONFIG = [
-  // ATRASOS: pipe Atividades, fases ativas (sem StandBy/Concluídos Geral), filtro due<=hoje
-  { tipo:'atrasos', pipeId: 302656757, phaseIds: [
-    '316588910','324961154','324961137','320305552','319202807','342038111','342956092'
-  ], filterDueBeforeToday: true },
-  // CS-NEGATIVAÇÕES: pipe Atividades, fase CS - Negativações
-  { tipo:'negacoes', pipeId: 302656757, phaseIds: ['342038111'] },
-  // MARKETPLACE: pipe Atividades, fase Cadastro de Marketplace
-  { tipo:'marketplace', pipeId: 302656757, phaseIds: ['342956092'] },
-  // VENCIDOS NA FASE: pipe Fluxo Clientes, todas exceto Churn/+12m/StandBy/Renovação/Churn-reversão
-  { tipo:'vencidos', pipeId: 302483272, phaseIds: 'auto-except', excludeIds: [
-    '318305336','317119749','320628025','342124327','333615572'
-  ]},
-  // DESATUALIZADOS: TODO — depende de cruzar updated_at do último comentário.
-  // Por ora vai junto com 'vencidos'; o agente/UI pode filtrar depois.
+// Fases a buscar por pipe (lista única — cada fase só puxada 1x)
+const PIPES_E_FASES = [
+  {
+    pipeId: 302656757, // Atendimento - Atividades do Cliente
+    phaseIds: ['316588910','324961154','324961137','320305552','319202807','342038111','342956092'],
+    // Excluído: 316705020 StandBy, 316891459 Concluídos Geral
+  },
+  {
+    pipeId: 302483272, // Fluxo Clientes
+    phaseIds: 'auto-except',
+    excludeIds: ['318305336','317119749','320628025','342124327','333615572'],
+  },
 ];
+
+// Regra de classificação por card. UM card pode receber MAIS DE UM tipo (ex: negacoes + marketplace).
+// As regras evitam que "Solicitação de negativação" vaze pra Atrasos.
+function deriveTipos(node, pipeId, fmap){
+  const tipos = [];
+  const fase = node.current_phase?.name || '';
+  const sol  = (fmap['solicitação']||fmap['solicitacao']||'').trim().toLowerCase();
+
+  if (pipeId === 302656757){
+    const isNeg       = sol === 'solicitação de negativação';
+    const isSugestao  = sol === 'sugestão de notificação extrajudicial';
+    const isMarket    = fase === 'Cadastro de Marketplace';
+
+    if (isNeg)    tipos.push('negacoes');
+    if (isMarket) tipos.push('marketplace');
+
+    // Atrasos:
+    //   (a) Sugestão de NE em Backlog/Pedidos → sempre (agente atua)
+    //   (b) Demais cards: due_date <= hoje E updated_at <= data_vencimento (não tocado depois do venc.)
+    //       Exclui "Solicitação de negativação" (tem aba própria) e Marketplace
+    if (isSugestao && fase === 'Backlog / Pedidos'){
+      tipos.push('atrasos');
+    } else if (!isNeg && !isMarket){
+      const due = node.due_date ? new Date(node.due_date) : null;
+      if (due){
+        due.setHours(0,0,0,0);
+        const today = new Date(); today.setHours(0,0,0,0);
+        if (due <= today){
+          const upd = node.updated_at ? new Date(node.updated_at) : null;
+          if (!upd || upd <= due) tipos.push('atrasos');
+        }
+      }
+    }
+  } else if (pipeId === 302483272){
+    tipos.push('vencidos');
+  }
+
+  return tipos;
+}
 
 async function syncPipefy(){
   if (state.syncing) return;
   state.syncing = true;
-  banner(`Sincronizando ${TIPOS_CONFIG.length} tipos do Pipefy… <span class="bar"><div id="sync-bar"></div></span>`);
+  banner(`Sincronizando Pipefy… <span class="bar"><div id="sync-bar"></div></span>`);
   const setBar = (p)=>{ const b=$('#sync-bar'); if (b) b.style.width = p+'%'; };
   setBar(10);
   try {
-    // Passo 1: resolver phaseIds de cada tipo
-    const tipoPhaseIds = {};
-    for (const tc of TIPOS_CONFIG){
-      tipoPhaseIds[tc.tipo] = await resolvePhaseIds(tc);
+    // Passo 1: mapear cada fase → pipe de origem
+    const phaseToPipe = {};
+    for (const pf of PIPES_E_FASES){
+      const ids = await resolvePhaseIds(pf);
+      for (const id of ids) phaseToPipe[id] = pf.pipeId;
     }
-    // Passo 2: fetch único por fase (mesma fase em vários tipos = 1 chamada só)
-    const allPhases = [...new Set(Object.values(tipoPhaseIds).flat())];
+    const allPhases = Object.keys(phaseToPipe);
     setBar(20);
-    const phaseNodesMap = {};
+    // Passo 2: fetch único por fase, em paralelo
     const nodesArr = await Promise.all(allPhases.map(async (pid, idx) => {
-      // Pagina cada fase isoladamente
       const out = [];
       let first = await fetchPhasePage(pid, 50, null);
       out.push(...first.cards);
@@ -659,33 +694,23 @@ async function syncPipefy(){
       setBar(20 + Math.round(60*(idx+1)/allPhases.length));
       return [pid, out];
     }));
-    nodesArr.forEach(([pid, nodes]) => { phaseNodesMap[pid] = nodes; });
-
-    // Passo 3: monta a lista de cards POR tipo (mesmo node pode virar 2 cards de tipos diferentes)
+    // Passo 3: classificar cada node via deriveTipos (1 node → 0..N cards)
     const cards = [];
-    for (const tc of TIPOS_CONFIG){
-      for (const pid of tipoPhaseIds[tc.tipo]){
-        for (const node of (phaseNodesMap[pid]||[])){
-          cards.push(normalizarCard(node, tc));
+    for (const [pid, nodes] of nodesArr){
+      const pipeId = phaseToPipe[pid];
+      for (const node of nodes){
+        const fmap = {};
+        for (const f of (node.fields||[])) fmap[(f.name||'').toLowerCase().trim()] = f.value;
+        const tipos = deriveTipos(node, pipeId, fmap);
+        for (const tipo of tipos){
+          cards.push(normalizarCard(node, {tipo, pipeId}, fmap));
         }
       }
     }
 
-    // Atrasos: due_date <= hoje. EXCEÇÃO: cards de Backlog/Pedidos com
-    // "Sugestão de notificação extrajudicial" sempre aparecem (mesmo com due futuro)
-    // — esses são o foco do agente NE.
-    const today = new Date(); today.setHours(0,0,0,0);
-    state.cards = cards.filter(c => {
-      if (c.tipo === 'atrasos'){
-        const isSugestaoNE = c.fase === 'Backlog / Pedidos'
-          && (c.solicitacao||'').trim().toLowerCase() === 'sugestão de notificação extrajudicial';
-        if (isSugestaoNE) return true;
-        if (!c.data_vencimento) return false;
-        const d = new Date(c.data_vencimento); d.setHours(0,0,0,0);
-        if (d > today) return false;
-      }
-      return true;
-    });
+    // deriveTipos já aplicou todas as regras de Atrasos/Negacoes/Marketplace/Vencidos.
+    // Aqui apenas atribuímos.
+    state.cards = cards;
 
     // Cross-reference: INPI nativo do Fluxo Clientes → cards de NE
     state.clienteToInpi = {};
@@ -774,24 +799,23 @@ function parseDateBR(s){
   return isNaN(d) ? null : d;
 }
 
-function normalizarCard(node, tc){
-  const fmap = {};
-  for (const f of (node.fields || [])){
-    fmap[(f.name||'').toLowerCase().trim()] = f.value;
-  }
+function normalizarCard(node, {tipo, pipeId}, fmapPre){
+  const fmap = fmapPre || (()=>{
+    const m = {};
+    for (const f of (node.fields || [])) m[(f.name||'').toLowerCase().trim()] = f.value;
+    return m;
+  })();
 
   const titulo = node.title
     || parseArrFirst(fmap['campanha'])
     || parseArrFirst(fmap['nome do cliente'])
     || '';
 
-  // Carteira: campo nativo do Pipefy (com ou sem "(Preenchimento automático)").
   let carteira = parseArrFirst(fmap['categoria do cliente (preenchimento automático)'])
               || parseArrFirst(fmap['categoria do cliente'])
               || '';
   if (!carteira) carteira = carteiraPorTitulo(titulo);
 
-  // Data de vencimento: node.due_date é ISO direto da API
   let dueDate = node.due_date ? new Date(node.due_date) : null;
   if (dueDate && isNaN(dueDate)) dueDate = null;
 
@@ -800,7 +824,7 @@ function normalizarCard(node, tc){
   return {
     id: node.id,
     titulo,
-    tipo: tc.tipo,
+    tipo,
     carteira,
     responsavel: parseArrFirst(fmap['solicitante']) || parseArrFirst(fmap['responsável']) || parseArrFirst(fmap['responsavel']) || '',
     fase: node.current_phase?.name || '',
@@ -810,8 +834,9 @@ function normalizarCard(node, tc){
     concorrente: fmap['concorrente'] || fmap['domínio do concorrente'] || fmap['dominio'] || '',
     link_pipefy: node.url || '',
     data_onboarding: onbDate ? onbDate.toISOString() : null,
-    inpi_field: fmap['inpi'] || null, // nativo no Fluxo Clientes (Nominativo/Misto)
-    pipe_id: tc.pipeId,
+    inpi_field: fmap['inpi'] || null,
+    updated_at_pipefy: node.updated_at || null,
+    pipe_id: pipeId,
   };
 }
 
