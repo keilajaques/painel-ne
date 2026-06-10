@@ -294,15 +294,30 @@ const DEFAULT_CONFIG = {
   // bmsProxyPath aponta para uma Supabase Edge Function que faz o proxy seguro.
   bmsProxyPath:   '/functions/v1/bms-lookup',
   gchatWebhook:   '',
-  // Pipes
-  pipeAtividades: 302656757, // Atividades do Cliente
-  pipeFluxo:      302483272, // Fluxo Clientes
-  pipeMarketplace:306913660, // Cadastros MARKETPLACES
-  // Report IDs do Pipefy — preenchidos via Configurar
-  reportAtrasos:       '',
-  reportNegacoes:      '',
-  reportMarketplace:   '',
-  reportDesatualizados:'',
+  // Pipes (validados via API)
+  pipeAtividades: 302656757, // "Atendimento - Atividades do Cliente"
+  pipeFluxo:      302483272, // "Atendimento > Fluxo Clientes"
+  pipeMarketplace:306913660, // "Cadastros MARKETPLACES"
+};
+
+// Fases descobertas via introspecção da API do Pipefy
+const FASES = {
+  // Pipe 302656757 — Atendimento - Atividades do Cliente
+  backlogPedidos:        '316588910',
+  backlogNegativacao:    '324961154',
+  enviadoNegativacao:    '324961137',
+  doing:                 '320305552',
+  enviadoCliente:        '319202807',
+  standByAtividades:     '316705020',
+  csNegacoes:            '342038111',
+  marketplace:           '342956092',
+  concluidosGeral:       '316891459',
+  // Pipe 302483272 — Fluxo Clientes (a excluir)
+  fluxoChurn:            '318305336',
+  fluxoMais12Meses:      '317119749',
+  fluxoStandBy:          '320628025',
+  fluxoRenovacao:        '342124327',
+  fluxoChurnReversao:    '333615572',
 };
 function loadConfig(){
   try {
@@ -330,9 +345,6 @@ const METAS_ANALISTA = {
   'Amaore':   ['Black 1','Black 3'],
   'Railanne': ['Platinum 2','__cs-negacoes__'], // marcador para CS-Negociações
 };
-
-// Fases a excluir em Vencidos na Fase (Fluxo Clientes)
-const FASES_EXCLUIR = ['Churn','Mais de 12 meses','StandBy','Renovação'];
 
 // Sub-filtros do CS Front e quais tipos cada um inclui
 const SUB_TIPOS = {
@@ -487,35 +499,9 @@ async function pipefy(query, variables){
   return json.data;
 }
 
-// busca relatório (reportId) — retorna linhas
-async function fetchReport(reportId){
-  // ATENÇÃO: a query exata depende do schema atual do Pipefy.
-  // Aqui usamos uma forma genérica; ajustar conforme necessário.
-  const q = `query($id: ID!, $first: Int, $after: String){
-    table_records_report(report_id: $id, first: $first, after: $after){
-      edges { node { id title url current_phase{name} record_fields{name value} } }
-      pageInfo { endCursor hasNextPage }
-    }
-  }`;
-  const out = [];
-  let after = null;
-  let safety = 50;
-  while (safety-- > 0){
-    const data = await pipefy(q, {id:reportId, first:100, after});
-    const edges = data.table_records_report?.edges || [];
-    for (const e of edges) out.push(e.node);
-    if (!data.table_records_report?.pageInfo?.hasNextPage) break;
-    after = data.table_records_report.pageInfo.endCursor;
-  }
-  return out;
-}
-
-// busca cards de um pipe, paginando por fase
-async function fetchPipe(pipeId){
-  const phasesQ = `query($id: ID!){ pipe(id:$id){ id name phases{ id name cards_count } } }`;
-  const pData = await pipefy(phasesQ, {id:pipeId});
-  const phases = pData.pipe?.phases || [];
-  const phaseCardsQ = `query($id: ID!, $first:Int, $after:String){
+// Busca uma página de cards de uma fase específica
+async function fetchPhasePage(phaseId, first, after){
+  const q = `query($id:ID!,$first:Int,$after:String){
     phase(id:$id){
       cards(first:$first, after:$after){
         edges{ node{ id title url due_date current_phase{name} updated_at fields{name value} } }
@@ -523,32 +509,45 @@ async function fetchPipe(pipeId){
       }
     }
   }`;
-  // 1ª página de todas as fases em paralelo
-  const firstPageResults = await Promise.all(phases.map(p =>
-    pipefy(phaseCardsQ, {id:p.id, first:50, after:null}).then(d => ({phase:p, data:d}))
-  ));
+  const d = await pipefy(q, {id:phaseId, first, after});
+  const edges = d.phase?.cards?.edges || [];
+  return {
+    cards: edges.map(e => e.node),
+    next: d.phase?.cards?.pageInfo?.hasNextPage ? d.phase.cards.pageInfo.endCursor : null,
+  };
+}
+
+// Pagina todas as fases informadas (1ª página em paralelo + restante serial por fase)
+async function fetchPhases(phaseIds){
+  if (!phaseIds.length) return [];
+  const firstResults = await Promise.all(phaseIds.map(pid => fetchPhasePage(pid, 50, null)));
   const all = [];
-  const morePages = [];
-  for (const {phase, data} of firstPageResults){
-    const edges = data.phase?.cards?.edges || [];
-    edges.forEach(e => all.push(e.node));
-    if (data.phase?.cards?.pageInfo?.hasNextPage){
-      morePages.push({phaseId:phase.id, cursor:data.phase.cards.pageInfo.endCursor});
-    }
-  }
-  // paginação subsequente: apenas fases que têm mais
-  for (const pg of morePages){
-    let after = pg.cursor;
+  const tails = [];
+  firstResults.forEach((r, idx) => {
+    all.push(...r.cards);
+    if (r.next) tails.push({phaseId: phaseIds[idx], cursor: r.next});
+  });
+  for (const t of tails){
+    let after = t.cursor;
     let safety = 50;
-    while (safety-- > 0){
-      const d = await pipefy(phaseCardsQ, {id:pg.phaseId, first:100, after});
-      const edges = d.phase?.cards?.edges || [];
-      edges.forEach(e => all.push(e.node));
-      if (!d.phase?.cards?.pageInfo?.hasNextPage) break;
-      after = d.phase.cards.pageInfo.endCursor;
+    while (after && safety-- > 0){
+      const more = await fetchPhasePage(t.phaseId, 100, after);
+      all.push(...more.cards);
+      after = more.next;
     }
   }
   return all;
+}
+
+// Resolve a lista de phaseIds que o tipo precisa (incluindo 'auto-except')
+async function resolvePhaseIds(tc){
+  if (Array.isArray(tc.phaseIds)) return tc.phaseIds;
+  if (tc.phaseIds === 'auto-except'){
+    const d = await pipefy(`{ pipe(id: ${tc.pipeId}) { phases { id } } }`);
+    const all = (d.pipe?.phases||[]).map(p => p.id);
+    return all.filter(id => !(tc.excludeIds||[]).includes(id));
+  }
+  return [];
 }
 
 // publica comentário em card
@@ -570,30 +569,33 @@ async function updateDueDate(cardId, isoDate){
    SYNC — 5 tipos em paralelo
    ============================================================ */
 const TIPOS_CONFIG = [
-  { tipo:'atrasos',       fonte:'report', reportKey:'reportAtrasos',      pipeKey:'pipeAtividades' },
-  { tipo:'negacoes',      fonte:'report', reportKey:'reportNegacoes',     pipeKey:'pipeAtividades' },
-  { tipo:'marketplace',   fonte:'report', reportKey:'reportMarketplace',  pipeKey:'pipeAtividades' },
-  { tipo:'vencidos',      fonte:'pipe',   pipeKey:'pipeFluxo' },
-  { tipo:'desatualizados',fonte:'report', reportKey:'reportDesatualizados', pipeKey:'pipeFluxo' },
+  // ATRASOS: pipe Atividades, fases ativas (sem StandBy/Concluídos Geral), filtro due<=hoje
+  { tipo:'atrasos', pipeId: 302656757, phaseIds: [
+    '316588910','324961154','324961137','320305552','319202807','342038111','342956092'
+  ], filterDueBeforeToday: true },
+  // CS-NEGATIVAÇÕES: pipe Atividades, fase CS - Negativações
+  { tipo:'negacoes', pipeId: 302656757, phaseIds: ['342038111'] },
+  // MARKETPLACE: pipe Atividades, fase Cadastro de Marketplace
+  { tipo:'marketplace', pipeId: 302656757, phaseIds: ['342956092'] },
+  // VENCIDOS NA FASE: pipe Fluxo Clientes, todas exceto Churn/+12m/StandBy/Renovação/Churn-reversão
+  { tipo:'vencidos', pipeId: 302483272, phaseIds: 'auto-except', excludeIds: [
+    '318305336','317119749','320628025','342124327','333615572'
+  ]},
+  // DESATUALIZADOS: TODO — depende de cruzar updated_at do último comentário.
+  // Por ora vai junto com 'vencidos'; o agente/UI pode filtrar depois.
 ];
 
 async function syncPipefy(){
   if (state.syncing) return;
   state.syncing = true;
-  banner(`Sincronizando 5 tipos do Pipefy… <span class="bar"><div id="sync-bar"></div></span>`);
-  $('#sync-bar').style.width = '10%';
+  banner(`Sincronizando ${TIPOS_CONFIG.length} tipos do Pipefy… <span class="bar"><div id="sync-bar"></div></span>`);
+  const setBar = (p)=>{ const b=$('#sync-bar'); if (b) b.style.width = p+'%'; };
+  setBar(10);
   try {
     const results = await Promise.allSettled(TIPOS_CONFIG.map(async (tc, idx) => {
-      let raw = [];
-      if (tc.fonte === 'report'){
-        const rid = CONFIG[tc.reportKey];
-        if (!rid) throw new Error('Report ID faltando: '+tc.reportKey);
-        raw = await fetchReport(rid);
-      } else {
-        const pid = CONFIG[tc.pipeKey];
-        raw = await fetchPipe(pid);
-      }
-      const bar = $('#sync-bar'); if (bar) bar.style.width = (20 + 18*(idx+1)) + '%';
+      const phaseIds = await resolvePhaseIds(tc);
+      const raw = await fetchPhases(phaseIds);
+      setBar(20 + 18*(idx+1));
       return raw.map(r => normalizarCard(r, tc));
     }));
 
@@ -603,33 +605,33 @@ async function syncPipefy(){
       else console.warn('Sync falhou para', TIPOS_CONFIG[i].tipo, r.reason);
     });
 
-    // filtros adicionais
+    // Atrasos: só mantém com due_date <= hoje (vencimento futuro fora)
     const today = new Date(); today.setHours(0,0,0,0);
     state.cards = cards.filter(c => {
-      // Atrasos: vencimento <= hoje
-      if (c.tipo === 'atrasos' && c.data_vencimento){
+      if (c.tipo === 'atrasos'){
+        if (!c.data_vencimento) return false;
         const d = new Date(c.data_vencimento); d.setHours(0,0,0,0);
         if (d > today) return false;
-      }
-      // Vencidos na Fase: exclui fases
-      if (c.tipo === 'vencidos' && c.fase && FASES_EXCLUIR.includes(c.fase)) return false;
-      // Cards com vencimento futuro: ocultar
-      if (c.data_vencimento){
-        const d = new Date(c.data_vencimento); d.setHours(0,0,0,0);
-        if (d > today && c.tipo !== 'vencidos') return false;
       }
       return true;
     });
 
-    // upsert em auditoria_cards (NUNCA deletar)
+    // Upsert no Supabase: dedupe por id (mesma card pode aparecer como atrasos+negacoes).
+    // Prioridade do tipo: negacoes > marketplace > vencidos > atrasos.
     if (supa && state.cards.length){
-      const rows = state.cards.map(c => ({
+      const prio = { negacoes:4, marketplace:3, vencidos:2, atrasos:1 };
+      const byId = new Map();
+      for (const c of state.cards){
+        const cur = byId.get(c.id);
+        if (!cur || (prio[c.tipo]||0) > (prio[cur.tipo]||0)) byId.set(c.id, c);
+      }
+      const rows = [...byId.values()].map(c => ({
         id: c.id, titulo: c.titulo, tipo: c.tipo, carteira: c.carteira,
         responsavel: c.responsavel, fase: c.fase,
         data_vencimento: c.data_vencimento, dias_atraso: c.dias_atraso,
         solicitacao: c.solicitacao, concorrente: c.concorrente,
         link_pipefy: c.link_pipefy, data_onboarding: c.data_onboarding,
-        pipe_id: c.pipe_id, report_id: c.report_id,
+        pipe_id: c.pipe_id, report_id: null,
         synced_at: new Date().toISOString(),
       }));
       const chunks = [];
@@ -661,29 +663,67 @@ async function syncPipefy(){
   }
 }
 
+// Parse JSON array do Pipefy. Ex: '["Titanium 2"]' → 'Titanium 2'. Fallback retorna a string original.
+function parseArrFirst(s){
+  if (!s) return '';
+  const str = String(s).trim();
+  if (str.startsWith('[')){
+    try {
+      const arr = JSON.parse(str);
+      if (Array.isArray(arr) && arr.length) return String(arr[0]);
+    } catch {}
+  }
+  return str;
+}
+function parseArrAll(s){
+  if (!s) return [];
+  const str = String(s).trim();
+  if (str.startsWith('[')){
+    try { const arr = JSON.parse(str); if (Array.isArray(arr)) return arr.map(String); } catch {}
+  }
+  return [str];
+}
+
+function parseDateBR(s){
+  if (!s) return null;
+  const str = String(s).trim();
+  // dd/mm/aaaa
+  const m = str.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m) return new Date(+m[3], +m[2]-1, +m[1]);
+  // ISO ou outro
+  const d = new Date(str);
+  return isNaN(d) ? null : d;
+}
+
 function normalizarCard(node, tc){
-  const fields = node.fields || node.record_fields || [];
   const fmap = {};
-  for (const f of fields) fmap[(f.name||'').toLowerCase()] = f.value;
-  const titulo = node.title || fmap['empresa'] || fmap['cliente'] || '';
-  const due = node.due_date || fmap['data de vencimento'] || fmap['vencimento'];
-  let dueDate = null;
-  if (due){
-    if (typeof due === 'number' || /^\d+(\.\d+)?$/.test(String(due))) dueDate = excelToDate(due);
-    else { const d = new Date(due); dueDate = isNaN(d) ? null : d; }
+  for (const f of (node.fields || [])){
+    fmap[(f.name||'').toLowerCase().trim()] = f.value;
   }
-  const onb = fmap['data de onboarding'] || fmap['onboarding'];
-  let onbDate = null;
-  if (onb){
-    if (typeof onb === 'number' || /^\d+(\.\d+)?$/.test(String(onb))) onbDate = excelToDate(onb);
-    else { const d = new Date(onb); onbDate = isNaN(d) ? null : d; }
-  }
+
+  const titulo = node.title
+    || parseArrFirst(fmap['campanha'])
+    || parseArrFirst(fmap['nome do cliente'])
+    || '';
+
+  // Carteira: campo nativo do Pipefy (com ou sem "(Preenchimento automático)").
+  let carteira = parseArrFirst(fmap['categoria do cliente (preenchimento automático)'])
+              || parseArrFirst(fmap['categoria do cliente'])
+              || '';
+  if (!carteira) carteira = carteiraPorTitulo(titulo);
+
+  // Data de vencimento: node.due_date é ISO direto da API
+  let dueDate = node.due_date ? new Date(node.due_date) : null;
+  if (dueDate && isNaN(dueDate)) dueDate = null;
+
+  const onbDate = parseDateBR(fmap['data do onboarding'] || fmap['data de onboarding'] || fmap['onboarding']);
+
   return {
     id: node.id,
     titulo,
     tipo: tc.tipo,
-    carteira: carteiraPorTitulo(titulo),
-    responsavel: fmap['responsável'] || fmap['responsavel'] || '',
+    carteira,
+    responsavel: parseArrFirst(fmap['solicitante']) || parseArrFirst(fmap['responsável']) || parseArrFirst(fmap['responsavel']) || '',
     fase: node.current_phase?.name || '',
     data_vencimento: dueDate ? dueDate.toISOString() : null,
     dias_atraso: diasAtraso(dueDate),
@@ -691,8 +731,8 @@ function normalizarCard(node, tc){
     concorrente: fmap['concorrente'] || fmap['domínio do concorrente'] || fmap['dominio'] || '',
     link_pipefy: node.url || '',
     data_onboarding: onbDate ? onbDate.toISOString() : null,
-    pipe_id: CONFIG[tc.pipeKey] || null,
-    report_id: tc.reportKey ? CONFIG[tc.reportKey] : null,
+    inpi_field: fmap['inpi'] || null, // nativo no Fluxo Clientes (Nominativo/Misto)
+    pipe_id: tc.pipeId,
   };
 }
 
@@ -774,8 +814,11 @@ async function fetchBMS(card){
    AGENTE NE — Etapas 0-4
    ============================================================ */
 function deveAnalisarNE(card){
-  return card.tipo === 'negacoes'
-    && card.solicitacao?.trim().toLowerCase() === 'sugestão de notificação extrajudicial';
+  if (card.tipo !== 'negacoes') return false;
+  const sol = (card.solicitacao||'').trim().toLowerCase();
+  return sol === 'sugestão de notificação extrajudicial'
+      || sol === 'solicitação de negativação'
+      || sol === 'solicitacao de negativacao';
 }
 
 // Identificar fase do caso a partir de comentários (Pipefy GraphQL)
@@ -1657,16 +1700,10 @@ function openConfigModal(){
   $('#modal-ctx').textContent = 'Credenciais e parâmetros (armazenado em localStorage)';
   const body = $('#modal-body'); body.innerHTML = '';
   const fields = [
-    ['supabaseUrl','Supabase URL'],
-    ['supabaseKey','Supabase anon key'],
-    ['pipefyToken','Pipefy token'],
-    ['bmsUrl','BMS API URL'],
-    ['bmsToken','BMS token'],
-    ['gchatWebhook','Google Chat webhook'],
-    ['reportAtrasos','Report ID — Atrasos'],
-    ['reportNegacoes','Report ID — CS Negativações'],
-    ['reportMarketplace','Report ID — Cadastro Marketplace'],
-    ['reportDesatualizados','Report ID — Desatualizados'],
+    ['pipefyToken','Pipefy token (https://app.pipefy.com/tokens)'],
+    ['supabaseUrl','Supabase URL (já preenchido)'],
+    ['supabaseKey','Supabase anon key (já preenchido)'],
+    ['gchatWebhook','Google Chat webhook (opcional — pro botão Enviar Resumo)'],
   ];
   for (const [k,lbl] of fields){
     body.appendChild(el('label',{},lbl));
