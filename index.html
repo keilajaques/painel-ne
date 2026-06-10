@@ -616,6 +616,14 @@ async function syncPipefy(){
       return true;
     });
 
+    // Cross-reference: INPI nativo do Fluxo Clientes → cards de NE
+    state.clienteToInpi = {};
+    for (const c of state.cards){
+      if (c.tipo === 'vencidos' && c.inpi_field && c.titulo){
+        state.clienteToInpi[c.titulo.toLowerCase().trim()] = c.inpi_field;
+      }
+    }
+
     // Upsert no Supabase: dedupe por id (mesma card pode aparecer como atrasos+negacoes).
     // Prioridade do tipo: negacoes > marketplace > vencidos > atrasos.
     if (supa && state.cards.length){
@@ -814,11 +822,13 @@ async function fetchBMS(card){
    AGENTE NE — Etapas 0-4
    ============================================================ */
 function deveAnalisarNE(card){
-  if (card.tipo !== 'negacoes') return false;
+  // Agente atua EXCLUSIVAMENTE em:
+  //   fase === "Backlog / Pedidos"  E  solicitacao === "Sugestão de notificação extrajudicial"
+  // Qualquer outra combinação (fase diferente, ou solicitação diferente) é ignorada.
+  if (card.fase !== 'Backlog / Pedidos') return false;
   const sol = (card.solicitacao||'').trim().toLowerCase();
   return sol === 'sugestão de notificação extrajudicial'
-      || sol === 'solicitação de negativação'
-      || sol === 'solicitacao de negativacao';
+      || sol === 'sugestao de notificacao extrajudicial';
 }
 
 // Identificar fase do caso a partir de comentários (Pipefy GraphQL)
@@ -967,8 +977,11 @@ async function rodarAgenteNE(card){
   const coments = comentsRes.status==='fulfilled' ? comentsRes.value : [];
   const faseNE = identificarFase(coments);
 
-  // INPI status: vem do controle manual (analista preenche) — guardado em controles.validacao? não — usaremos campo dedicado em neAnalises ou controles. Aqui buscamos do próprio neAnalises se já houver, senão pedimos manual.
-  let inpiStatus = state.neAnalises[card.id]?.inpi_status_manual || null;
+  // INPI: 1) manual do analista; 2) campo INPI nativo do Fluxo Clientes (cross-ref por nome); 3) null
+  const tituloKey = (card.titulo||'').toLowerCase().trim();
+  let inpiStatus = state.neAnalises[card.id]?.inpi_status_manual
+                || state.clienteToInpi?.[tituloKey]
+                || null;
 
   // Etapa 1 — Filtro Eliminatório
   let bloqueado = false, motivo = null;
@@ -1046,7 +1059,14 @@ async function rodarAgenteNE(card){
 
 // Dispara agente em background para cards novos / análises antigas
 function scheduleNEAgentForNewCards(){
-  const elegiveis = state.cards.filter(deveAnalisarNE);
+  // dedupe por id (mesmo card pode estar em state.cards como atrasos E negacoes)
+  const seen = new Set();
+  const elegiveis = state.cards.filter(c => {
+    if (seen.has(c.id)) return false;
+    if (!deveAnalisarNE(c)) return false;
+    seen.add(c.id);
+    return true;
+  });
   const agora = Date.now();
   const SEIS_HORAS = 6*3600*1000;
   const fila = elegiveis.filter(c => {
@@ -1083,7 +1103,7 @@ const COLS_BASE = [
   {key:'analista', label:'Analista CS', sortable:false},
   {key:'obs', label:'Observações', sortable:false, hideFor:['outros']},
   {key:'validacao', label:'Validação', sortable:false, hideFor:['outros']},
-  {key:'ne_status', label:'NE', sortable:false, onlyTipo:'negacoes'},
+  {key:'ne_status', label:'NE', sortable:false, hideFor:['outros','negacoes']},
   {key:'acao', label:'Ação', sortable:false, css:'cell-action'},
 ];
 
