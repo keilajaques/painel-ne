@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Branddi · Auditoria + NE</title>
 <style>
 :root{
@@ -157,12 +160,25 @@ input[type=checkbox]{accent-color:var(--brand);cursor:pointer}
 .ne-stat .val{font-size:14px;font-weight:700;font-family:var(--mono);margin-top:2px}
 .ne-stat.score .val{color:var(--brand)}
 .ne-stat.block .val{color:var(--red)}
+.ne-scorebox{border-top:1px solid var(--border);background:var(--surface);padding:10px 14px}
+.ne-scorebox .sc-head{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.score-table{width:100%;border-collapse:collapse;font-size:12px}
+.score-table tr{border-bottom:1px dashed var(--border2)}
+.score-table tr:last-child{border-bottom:none}
+.score-table td{padding:4px 0}
+.score-table .sc-lbl{color:var(--text2)}
+.score-table .sc-val{text-align:right;font-family:var(--mono);color:var(--text);font-weight:600;white-space:nowrap}
+.score-table .sc-total td{padding-top:8px;font-size:13px}
+.score-table .sc-total .sc-lbl{color:var(--text);font-weight:700;letter-spacing:.04em}
+.score-table .sc-total .sc-val{color:var(--brand);font-weight:800}
 .ne-decision{padding:10px 14px;background:#e6f8f6;border-top:1px solid var(--border);font-size:12.5px}
 .ne-decision strong{color:var(--brand-dark)}
 .ne-warns{padding:8px 14px;border-top:1px solid var(--border);background:#fff7e6}
 .ne-warns ul{margin:4px 0 0 18px;padding:0;font-size:11.5px;color:#7a4a00}
 .ne-missing{padding:8px 14px;border-top:1px solid var(--border);background:#fdecec;color:#7a1c1c;font-size:11.5px}
 .ne-missing .missing-controls{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+.ne-partial{padding:8px 14px;border-top:1px solid var(--border);background:var(--surface2);color:var(--text2);font-size:11.5px}
+.ne-partial strong{color:var(--text)}
 .ne-email{border-top:1px solid var(--border);background:var(--surface)}
 .ne-email .em-head{padding:10px 14px;display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:12.5px}
 .ne-email .em-head .ap{font-size:10.5px;color:var(--text3);font-weight:500;margin-left:8px}
@@ -323,6 +339,9 @@ input[type=checkbox]{accent-color:var(--brand);cursor:pointer}
 /* ============================================================
    CONFIG
    ============================================================ */
+const APP_VERSION = 'v2.2-templates-apendices-2026-06-10';
+console.log('%c[Branddi Auditoria] '+APP_VERSION, 'background:#1abcac;color:#fff;padding:3px 8px;border-radius:4px;font-weight:bold');
+
 const DEFAULT_CONFIG = {
   // Supabase URL e anon key PODEM ficar embedados — anon key é desenhado pra ser público.
   // O acesso aos dados é controlado por RLS no Supabase, não pelo segredo da key.
@@ -835,6 +854,7 @@ function normalizarCard(node, {tipo, pipeId}, fmapPre){
     link_pipefy: node.url || '',
     data_onboarding: onbDate ? onbDate.toISOString() : null,
     inpi_field: fmap['inpi'] || null,
+    observacoes: fmap['observações'] || fmap['observacoes'] || '',
     updated_at_pipefy: node.updated_at || null,
     pipe_id: pipeId,
   };
@@ -944,104 +964,242 @@ function identificarFase(coments){
   return 'Fase 1';
 }
 
-// Etapa 2 — Score
-function calcularScore(bms){
+// Etapa 2 — Score (recebe bms + card pra checar observações/comentários)
+function calcularScore(bms, card, coments){
   const s = { A_termo:0, B_segmento:0, C1_ranking:0, C2_bms:0, D_frequencia:0, E_posicionamento:0, F_ciencia:0, G_topleilao:0, total:0 };
-  if (!bms) return s;
 
   // A. Característica do Termo
-  const t = (bms.caracteristica_termo||'').toLowerCase();
-  s.A_termo = t==='puro' ? 25 : t==='composto' ? 15 : t==='genérico'||t==='generico' ? 5 : 0;
+  if (bms){
+    const t = (bms.caracteristica_termo||'').toLowerCase();
+    s.A_termo = t==='puro' ? 25 : t==='composto' ? 15 : (t==='genérico'||t==='generico') ? 5 : 0;
+  }
 
   // B. Segmento
-  const seg = (bms.segmento_concorrente||'').toLowerCase();
-  s.B_segmento = seg.includes('mesmo') ? 20 : seg.includes('correlato') ? 10 : 0;
+  if (bms){
+    const seg = (bms.segmento_concorrente||'').toLowerCase();
+    s.B_segmento = seg.includes('mesmo') ? 20 : seg.includes('correlato') ? 10 : 0;
+  }
 
   // C1. Ranking
-  const pr = Number(bms.posicao_ranking)||0;
-  s.C1_ranking = (pr>0 && pr<=5) ? 5 : (pr>=6 && pr<=10) ? 3 : 0;
+  if (bms){
+    const pr = Number(bms.posicao_ranking)||0;
+    s.C1_ranking = (pr>0 && pr<=5) ? 5 : (pr>=6 && pr<=10) ? 3 : 0;
+  }
 
   // C2. Nota BMS
-  const nb = Number(bms.nota_bms)||0;
-  s.C2_bms = nb>=9 ? 10 : nb>=6 ? 7 : nb>=3 ? 4 : 0;
+  if (bms){
+    const nb = Number(bms.nota_bms)||0;
+    s.C2_bms = nb>=9 ? 10 : nb>=6 ? 7 : nb>=3 ? 4 : 0;
+  }
 
   // D. Frequência
-  const oc14 = Number(bms.ocorrencias_14d)||0, oc7 = Number(bms.ocorrencias_7d)||0;
-  s.D_frequencia = (oc14>0 && oc7>0) ? 15 : 0;
+  if (bms){
+    const oc14 = Number(bms.ocorrencias_14d)||0, oc7 = Number(bms.ocorrencias_7d)||0;
+    s.D_frequencia = (oc14>0 && oc7>0) ? 15 : 0;
+  }
 
-  // E. Posicionamento
-  const pos = (bms.posicionamento_concorrente||'').toLowerCase();
-  s.E_posicionamento = pos.includes('recus') || bms.tag_top_leilao_ativo ? 15 : pos.includes('sem') ? 5 : 0;
+  // E. Posicionamento do Concorrente (Pipefy) — Recusa expressa OU tag "Concorrente não quer contato"
+  // Evidências válidas: "negativa", "negou", "não realizará a negativação", "não deseja contato", etc.
+  const obs = (card?.observacoes||'').toLowerCase();
+  const comAll = (coments||[]).map(c=>(c.text||'').toLowerCase()).join('\n');
+  const haystack = obs + '\n' + comAll;
+  const refusedKeywords = [
+    'concorrente não quer contato','concorrente nao quer contato',
+    'negou','não realizará a negativação','nao realizara a negativacao',
+    'não deseja contato','nao deseja contato','recusou','recusa formal',
+  ];
+  const refusedInTexts = refusedKeywords.some(k => haystack.includes(k));
+  const refusedInBms = (bms?.posicionamento_concorrente||'').toLowerCase().includes('recus');
+  s.E_posicionamento = (refusedInTexts || refusedInBms) ? 15 : 5;
 
-  // F. Ciência
-  s.F_ciencia = bms.ciencia_negativacao ? 5 : 0;
+  // F. Ciência da Negativação
+  s.F_ciencia = bms?.ciencia_negativacao ? 5 : 0;
 
-  // G. Tag Top Leilão
-  s.G_topleilao = bms.tag_top_leilao_ativo ? 5 : 0;
+  // G. Tag Top Leilão Ativo
+  s.G_topleilao = bms?.tag_top_leilao_ativo ? 5 : 0;
 
   s.total = s.A_termo+s.B_segmento+s.C1_ranking+s.C2_bms+s.D_frequencia+s.E_posicionamento+s.F_ciencia+s.G_topleilao;
   return s;
 }
 
-// Etapa 3 — Árvore de decisão
-function decidirAcao(faseNE, score, bms){
+// Etapa 4 — Árvore de Decisão (exata, conforme spec)
+function decidirAcao(faseNE, score, bms, card, coments){
   const total = score.total;
   const top5 = (Number(bms?.posicao_ranking)||99) <= 5;
   const abertura = !!bms?.ciencia_negativacao;
   const autorizou = String(bms?.cliente_autorizou_envio||'').toLowerCase() === 'sim';
+  // Heurística: termo composto/genérico aumenta risco → precisa de dossiê
+  const tipo_termo = (bms?.caracteristica_termo||'').toLowerCase();
+  const precisaDossie = tipo_termo === 'composto' || tipo_termo === 'genérico' || tipo_termo === 'generico';
 
   if (faseNE === 'Fase 1'){
-    if (total < 11) return { decisao:'Monitorar (score baixo, sem ação)', apendice:null };
-    if (total >= 11 && top5 && abertura) return { decisao:'Dossiê jurídico + contraprova + NE Digital', apendice:'B' };
-    return { decisao:'GreenSign para OPEC', apendice:'B' };
+    if (total < 11) return {
+      decisao: 'Não sugerir NE. Monitorar e verificar aumento de agressividade.',
+      apendice: null
+    };
+    // Score >= 11
+    if (top5 && abertura){
+      if (precisaDossie) return {
+        decisao: 'Solicitar elaboração do dossiê ao jurídico + acionar contraprova → Sugerir envio de NE Digital ao cliente.',
+        apendice: 'B'
+      };
+      return {
+        decisao: 'Acionar contraprova → Sugerir envio de NE Digital ao cliente.',
+        apendice: 'B'
+      };
+    }
+    // Sem Top 5 ou sem comprovante de abertura
+    return {
+      decisao: 'Solicitar envio de comunicação via GreenSign para OPEC → Sugerir NE Digital ao cliente.',
+      apendice: 'B'
+    };
   }
+
   if (faseNE === 'Fase 2'){
-    if (total < 13) return { decisao:'Whitelist (score baixo)', apendice:'F' };
-    if (total >= 13 && !autorizou) return { decisao:'Whitelist (cliente não autorizou)', apendice:'F' };
-    if (total >= 13 && autorizou) return { decisao:'NE via Carta com AR', apendice:'C' };
+    if (total < 13) return {
+      decisao: 'Analisar redução das ocorrências. Sugerir whitelist se agressividade baixou.',
+      apendice: 'F'
+    };
+    if (!autorizou) return {
+      decisao: 'Adicionar à whitelist até mudança de posicionamento (cliente não autorizou NE Física).',
+      apendice: 'F'
+    };
+    return {
+      decisao: 'Solicitar ao jurídico envio de NE por carta com AR → Informar cliente.',
+      apendice: 'C'
+    };
   }
+
   if (faseNE === 'Fase 3'){
-    if (total < 15) return { decisao:'Whitelist (score baixo p/ litígio)', apendice:'F' };
-    if (total >= 15) return { decisao:'Litígio — via PFFA (D) ou internamente (E)', apendice:'D' };
+    if (total < 15) return {
+      decisao: 'Analisar redução das ocorrências. Sugerir whitelist se agressividade baixou.',
+      apendice: 'F'
+    };
+    // Score >= 15 — litígio. Escolher D ou E pela via da NE anterior.
+    const comAll = (coments||[]).map(c=>(c.text||'').toLowerCase()).join('\n');
+    const viaPFFA = /escrit[oó]rio parceiro|pffa|via escrit[oó]rio/.test(comAll);
+    const viaInterna = /enviad[oa] internamente|envio interno|min[uú]ta interna/.test(comAll);
+    if (viaInterna && !viaPFFA){
+      return { decisao: 'Sugerir litígio ao cliente — NE prévia enviada internamente; oferecer reenvio via escritório parceiro + jurídico interno.', apendice: 'E' };
+    }
+    // default → D (via PFFA / escritório parceiro)
+    return { decisao: 'Sugerir litígio ao cliente — NE prévia enviada via escritório parceiro; oferecer jurídico interno Branddi + continuidade com o parceiro.', apendice: 'D' };
   }
-  return { decisao:'Sem decisão', apendice:null };
+
+  return { decisao:'Sem decisão definida.', apendice:null };
 }
 
-// Etapa 4 — Templates de e-mail (placeholders por apêndice).
-// TODO: Cole aqui os textos reais dos Apêndices B, C, D, E, F.
+// Etapa 4 — Templates de e-mail (textos reais Apêndices B/C/D/E/F).
+// Apêndice A é injetado como ponto de atenção quando termo Composto/Genérico.
+const APENDICE_A_AVISO = 'Reforçamos o ponto de atenção: notificações baseadas em termos compostos ou genéricos, sem o uso do termo institucional da marca, podem ter menor força e abrir margem para questionamentos. Por isso, caso optem por seguir, é importante alinharmos que se trata de uma decisão com risco envolvido.';
+
 const TEMPLATES_EMAIL = {
   B: {
-    assunto: 'Notificação Extrajudicial Digital — Uso indevido de marca [CLIENTE]',
+    assunto: 'Sugestão de Notificação Extrajudicial | [CLIENTE] - [AGRESSOR] | Branddi',
     corpo:
-`Prezado(a) [NOME DO AGRESSOR],
+`Olá pessoal, tudo bem?
 
-A [CLIENTE], titular da marca [CLIENTE], identificou veiculação indevida em [DOMÍNIO] envolvendo os termos: [TERMOS].
+Estamos entrando em contato para informar que as etapas de mediação amigável com o agressor [NOME DO AGRESSOR] ([DOMÍNIO]) foram esgotadas; no entanto, anúncios seguem sendo registrados no monitoramento para os termos [TERMOS].
 
-Os anúncios foram detectados em posição [TOP X] do leilão patrocinado.
+Atualmente, o agressor se encontra na posição [TOP X] em agressividade. [DETALHAR TRATATIVAS: tivemos retorno X e Y / nunca obtivemos retorno]. Em anexo seguem as evidências capturadas nos últimos 14 dias.
 
-Solicitamos a remoção imediata da utilização não autorizada da marca, sob pena das medidas legais cabíveis.
+Como já esgotamos todas as tentativas de resolução amigável, precisamos escalar a tratativa com uma comunicação mais formal. Por isso, sugerimos o envio de uma notificação extrajudicial, que formaliza nossa solicitação de negativação de palavras-chave.
 
-Atenciosamente,
-[ANALISTA]
-Branddi — Em nome de [CLIENTE]
+A notificação pode ser enviada de duas formas:
 
---- TODO: substituir pelo texto real do Apêndice B ---`
+Via escritório de advocacia parceiro (bonificado): sem custo extra no contrato. Necessário apenas assinar uma procuração autorizando o escritório a realizar o envio.
+
+Internamente: disponibilizamos a minuta da NE em formato aberto para ajustes pelo jurídico interno, junto aos contatos válidos identificados e às evidências.
+
+Por fim, destacamos a importância de garantir que o termo do concorrente esteja negativado nas campanhas de vocês antes do envio da notificação. [INSERIR: "Poderiam nos enviar o print da negativação efetuada?" OU "Poderiam confirmar se a negativação anterior permanece aplicada?"]
+
+Nossa equipe também ativará uma contraprova dos termos do concorrente e, caso seja identificado qualquer anúncio, sinalizaremos para que possam realizar o ajuste.
+
+Ficamos no aguardo do posicionamento de vocês sobre como gostariam de seguir. Qualquer dúvida, estamos à disposição!
+
+Abraços,`
   },
   C: {
-    assunto: 'Notificação Extrajudicial (Carta com AR) — Uso indevido de marca [CLIENTE]',
-    corpo: `Prezado(a) [NOME DO AGRESSOR],\n\nReiteramos a notificação anteriormente enviada referente ao uso indevido da marca [CLIENTE] em [DOMÍNIO]...\n\n--- TODO: texto real do Apêndice C ---`
+    assunto: 'Notificação extrajudicial – nova tentativa via carta com AR',
+    corpo:
+`Olá, [NOME DO CLIENTE]! Tudo bem?
+
+Seguimos acompanhando o cenário envolvendo o domínio [NOME DO AGRESSOR] e, conforme alinhado anteriormente, realizamos o envio da notificação extrajudicial por e-mail através do nosso escritório de advocacia parceiro.
+
+Contudo, até o momento não houve retorno por parte do destinatário, tampouco identificamos qualquer mudança no comportamento do concorrente quanto à negativação do termo da marca.
+
+Diante disso, nossa equipe irá viabilizar o reenvio da notificação por carta com Aviso de Recebimento (AR), como forma de formalizar mais uma vez a solicitação e garantir um registro formal do pedido com comprovação do recebimento — último passo nesta etapa extrajudicial.
+
+Assim que houver atualização sobre o recebimento ou qualquer movimentação por parte do concorrente, manteremos vocês informados.
+
+Ficamos à disposição para qualquer dúvida.
+
+Abraços,`
   },
   D: {
-    assunto: 'Encaminhamento para análise jurídica — [CLIENTE] vs [DOMÍNIO]',
-    corpo: `Equipe PFFA,\n\nSegue o caso [CLIENTE] vs [DOMÍNIO] para análise e prosseguimento jurídico...\n\n--- TODO: texto real do Apêndice D ---`
+    assunto: 'Atualização sobre notificação extrajudicial – próximos passos possíveis | [CLIENTE] - Branddi',
+    corpo:
+`Olá, [NOME DO CLIENTE]! Tudo bem?
+
+Seguimos acompanhando o cenário da marca de vocês e gostaríamos de sinalizar que, mesmo após o envio da notificação extrajudicial realizada por meio do nosso escritório de advocacia parceiro, ainda estamos registrando anúncios ativos do concorrente para o seu termo de marca.
+
+Diante disso, existem dois caminhos possíveis para os próximos passos:
+
+1. Aconselhamento Jurídico Interno (Branddi)
+Podemos agendar um bate-papo com nosso jurídico interno para orientar sobre as opções legais e estratégicas disponíveis. Também podemos elaborar um dossiê completo com todas as evidências capturadas para que sigam com a tratativa pelo jurídico interno ou escritório de confiança.
+
+2. Continuidade com o Escritório de Advocacia Parceiro
+Também é possível realizar uma conversa diretamente com o escritório parceiro que já enviou a notificação, que poderá esclarecer dúvidas jurídicas mais específicas e, se for do interesse de vocês, dar sequência ao processo com o ajuizamento da ação.
+
+[Se aplicável: "Nosso time pode analisar os dados da conta de Google Ads de vocês para calcular o impacto deste concorrente e auxiliar na argumentação."]
+
+Em último caso, caso não optem pela sequência, sugerimos que o domínio seja adicionado à whitelist.
+
+Estamos à disposição. Nos avisem como preferem seguir!
+
+Abraços,`
   },
   E: {
-    assunto: 'Litígio interno — [CLIENTE] vs [DOMÍNIO]',
-    corpo: `Time jurídico interno,\n\nAbertura de procedimento de litígio interno para o caso [CLIENTE] vs [DOMÍNIO]...\n\n--- TODO: texto real do Apêndice E ---`
+    assunto: 'Atualização sobre notificação extrajudicial – suporte adicional disponível | [CLIENTE] - Branddi',
+    corpo:
+`Olá, [NOME DO CLIENTE]! Tudo bem?
+
+Seguimos monitorando o cenário da marca de vocês e, mesmo após o envio da notificação extrajudicial realizado internamente, ainda identificamos anúncios ativos do concorrente para o termo da marca.
+
+Sabemos que nem sempre a notificação inicial é suficiente para cessar a prática e, por isso, gostaríamos de reforçar que vocês contam com suporte adicional da Branddi para os próximos passos:
+
+1. Reenvio via escritório parceiro Branddi
+Disponibilizamos nosso escritório de advocacia parceiro para um novo envio com reforço jurídico especializado em Brand Bidding. Por ser parceiro Branddi, o escritório oferece condições diferenciadas para nossos clientes, inclusive para eventual ajuizamento.
+
+2. Aconselhamento Jurídico Interno (Branddi)
+Caso prefiram, podemos agendar um bate-papo com nosso jurídico interno para orientar sobre as melhores estratégias legais e elaborar um dossiê completo para seguirem com ajuizamento internamente ou com escritório de confiança.
+
+Em último caso, caso não optem pela sequência, sugerimos que o domínio seja adicionado à whitelist.
+
+Estamos à disposição. É só nos sinalizar como preferem seguir!
+
+Abraços,`
   },
   F: {
-    assunto: 'Whitelist sugerida — [CLIENTE] / [DOMÍNIO]',
-    corpo: `Equipe operacional,\n\nSugerimos colocar [DOMÍNIO] em whitelist no contexto de [CLIENTE], pelos motivos: [MOTIVOS].\n\n--- TODO: texto real do Apêndice F ---`
+    assunto: 'Encerramento de tratativas com [NOME DO AGRESSOR] – [CLIENTE] | Branddi',
+    corpo:
+`Olá, [NOME DO CLIENTE]! Tudo bem?
+
+Estamos passando para atualizá-los sobre o fim das comunicações com o agressor [NOME DO AGRESSOR].
+
+Após o envio de [X] notificações por [e-mail / telefone / carta com AR], finalizamos as tentativas de contato em razão de [ausência de resposta / recusa formal de negativação / solicitação para que não sejam realizados novos contatos].
+
+Apesar disso, analisando os dados atuais, observamos que a agressividade do domínio permanece muito baixa, com poucos anúncios ativos, [sem uso de termo puro da marca] e com posicionamentos menos relevantes nas buscas, sem aparições recentes no leilão.
+
+Diante desse cenário, nossa recomendação é que o domínio seja incluído em whitelist neste momento — ou seja, que o caso não seja priorizado para novas ações enquanto o comportamento seguir com esse mesmo padrão.
+
+Seguiremos com o monitoramento constante e, caso o domínio volte a apresentar um padrão de agressividade mais alto, sinalizaremos prontamente para reavaliarmos o caso e, se necessário, retomarmos as ações — seja com nova tentativa de contato, notificação extrajudicial ou encaminhamentos jurídicos adicionais.
+
+Podemos seguir desta forma?
+
+Ficamos à disposição para qualquer dúvida!
+
+Abraços,`
   },
 };
 
@@ -1049,13 +1207,22 @@ function gerarEmail(apendice, ctx){
   if (!apendice || !TEMPLATES_EMAIL[apendice]) return { assunto:'', corpo:'' };
   const tpl = TEMPLATES_EMAIL[apendice];
   const repl = (s) => s
+    // Cliente — todas as variantes
     .replaceAll('[CLIENTE]', ctx.cliente||'[CLIENTE]')
+    .replaceAll('[Cliente]', ctx.cliente||'[Cliente]')
+    .replaceAll('[NOME DO CLIENTE]', ctx.cliente||'[NOME DO CLIENTE]')
+    .replaceAll('[Nome do Cliente]', ctx.cliente||'[Nome do Cliente]')
+    // Agressor — todas as variantes
     .replaceAll('[NOME DO AGRESSOR]', ctx.agressor||'[NOME DO AGRESSOR]')
+    .replaceAll('[Nome do Agressor]', ctx.agressor||'[Nome do Agressor]')
+    .replaceAll('[AGRESSOR]', ctx.agressor||'[AGRESSOR]')
+    .replaceAll('[Agressor]', ctx.agressor||'[Agressor]')
+    // Demais
     .replaceAll('[DOMÍNIO]', ctx.dominio||'[DOMÍNIO]')
     .replaceAll('[TERMOS]', ctx.termos||'[TERMOS]')
     .replaceAll('[TOP X]', ctx.topx||'[TOP X]')
-    .replaceAll('[ANALISTA]', ctx.analista||'[ANALISTA]')
-    .replaceAll('[MOTIVOS]', ctx.motivos||'[MOTIVOS]');
+    .replaceAll('[X]', ctx.numNotificacoes||'[X]')
+    .replaceAll('[ANALISTA]', ctx.analista||'[ANALISTA]');
   return { assunto: repl(tpl.assunto), corpo: repl(tpl.corpo) };
 }
 
@@ -1090,12 +1257,16 @@ async function rodarAgenteNE(card){
   // INPI indisponível: NÃO bloqueia, mas exige ressalva obrigatória no e-mail
   const inpiIndisponivel = inpiStatus === 'INPI indisponível';
 
-  const score = calcularScore(bms);
+  const score = calcularScore(bms, card, coments);
   const pontos = [];
-  if (!bloqueado && score.D_frequencia === 0) pontos.push('Frequência zerada — reavaliar antes de progredir.');
+  // Pontos de atenção só sobre o que foi REALMENTE observado nos dados — não sobre ausência de dados.
   if (bms){
+    if (score.D_frequencia === 0) pontos.push('Frequência zerada nos últimos 14d/7d — reavaliar antes de progredir.');
     const t = (bms.caracteristica_termo||'').toLowerCase();
-    if (t==='composto' || t==='genérico' || t==='generico') pontos.push('Termo '+t+': risco aumentado em litígio. Ponderar.');
+    // Apêndice A — aviso obrigatório para termos compostos ou genéricos (texto verbatim do spec)
+    if (t==='composto' || t==='genérico' || t==='generico'){
+      pontos.push('Termo '+t+' — '+APENDICE_A_AVISO);
+    }
   }
   if (inpiIndisponivel) pontos.push('⚠ INPI indisponível no momento da análise — prosseguir com ressalva obrigatória; reconfirmar registro antes do envio definitivo.');
 
@@ -1109,10 +1280,10 @@ async function rodarAgenteNE(card){
   }
   if (!inpiStatus) dados_ausentes.push('INPI (status manual)');
 
-  // Decisão
+  // Decisão (Etapa 4 — árvore de decisão)
   let decisao = '—', apendice = null;
   if (!bloqueado){
-    const d = decidirAcao(faseNE, score, bms);
+    const d = decidirAcao(faseNE, score, bms, card, coments);
     decisao = d.decisao; apendice = d.apendice;
   } else {
     decisao = motivo;
@@ -1366,8 +1537,11 @@ function neBadge(card){
   const a = state.neAnalises[card.id];
   if (!a || a._loading) return el('span', {class:'ne-badge loading'}, '🔄 Analisando…');
   if (a.bloqueado) return el('span', {class:'ne-badge block', title:a.motivo_bloqueio||''}, '🔒 Bloqueado');
-  if (a.dados_ausentes?.length) return el('span', {class:'ne-badge warn', title:'Faltam: '+a.dados_ausentes.join(', ')}, '⚠ Score: '+a.score_json?.total+' · faltam dados');
-  return el('span', {class:'ne-badge ok', title:a.decisao}, '✓ '+a.score_json?.total+'/100 · '+(a.decisao||'').slice(0,28));
+  // Score sempre exibido. Dados parciais viram tooltip (não bloqueia, não alarma).
+  const tt = a.dados_ausentes?.length
+    ? `${a.decisao}\n(Análise com dados parciais — indisponíveis: ${a.dados_ausentes.join(', ')})`
+    : a.decisao;
+  return el('span', {class:'ne-badge ok', title:tt}, '✓ '+a.score_json?.total+'/100 · '+(a.decisao||'').slice(0,28));
 }
 
 function renderTable(){
@@ -1747,6 +1921,34 @@ function renderNEPanel(card){
     ),
   ));
 
+  // Tabela detalhada do Score (Etapa 3 do spec)
+  const s = a.score_json || {};
+  const rows = [
+    ['A. Característica do Termo',      s.A_termo,         25],
+    ['B. Segmento',                     s.B_segmento,      20],
+    ['C1. Posição no Ranking',          s.C1_ranking,       5],
+    ['C2. Nota de Agressividade',       s.C2_bms,          10],
+    ['D. Frequência/Recorrência',       s.D_frequencia,    15],
+    ['E. Posicionamento Concorrente',   s.E_posicionamento,15],
+    ['F. Ciência da Negativação',       s.F_ciencia,        5],
+    ['G. Top Leilão Ativo',             s.G_topleilao,      5],
+  ];
+  const tbl = el('table',{class:'score-table'});
+  for (const [lbl, val, max] of rows){
+    tbl.appendChild(el('tr',{},
+      el('td',{class:'sc-lbl'}, lbl),
+      el('td',{class:'sc-val'}, String(val||0)+' / '+max+' pts')
+    ));
+  }
+  tbl.appendChild(el('tr',{class:'sc-total'},
+    el('td',{class:'sc-lbl'}, 'TOTAL'),
+    el('td',{class:'sc-val'}, String(s.total||0)+' / 100')
+  ));
+  panel.appendChild(el('div',{class:'ne-scorebox'},
+    el('div',{class:'sc-head'}, 'SCORE DE AGRESSIVIDADE'),
+    tbl
+  ));
+
   panel.appendChild(el('div',{class:'ne-decision'},
     el('strong',{}, 'Decisão: '),
     a.decisao || '—'
@@ -1760,9 +1962,10 @@ function renderNEPanel(card){
     ));
   }
   if (a.dados_ausentes?.length){
-    panel.appendChild(el('div',{class:'ne-missing'},
-      el('strong',{},'⚠ Dados ausentes: '),
-      a.dados_ausentes.join(', ')
+    panel.appendChild(el('div',{class:'ne-partial'},
+      el('strong',{},'ℹ Análise com dados parciais — '),
+      'indisponíveis no momento: ', a.dados_ausentes.join(', '),
+      '. O score e a decisão acima usaram só o que estava disponível.'
     ));
   }
 
