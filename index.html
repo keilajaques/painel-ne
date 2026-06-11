@@ -339,19 +339,21 @@ input[type=checkbox]{accent-color:var(--brand);cursor:pointer}
 /* ============================================================
    CONFIG
    ============================================================ */
-const APP_VERSION = 'v2.2-templates-apendices-2026-06-10';
+const APP_VERSION = 'v2.5-email-sempre-gerado-2026-06-10';
 console.log('%c[Branddi Auditoria] '+APP_VERSION, 'background:#1abcac;color:#fff;padding:3px 8px;border-radius:4px;font-weight:bold');
 
 const DEFAULT_CONFIG = {
   // Supabase URL e anon key PODEM ficar embedados — anon key é desenhado pra ser público.
   // O acesso aos dados é controlado por RLS no Supabase, não pelo segredo da key.
-  supabaseUrl:    'https://lcwxsikveyudtwiutjra.supabase.co',
-  supabaseKey:    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxjd3hzaWt2ZXl1ZHR3aXV0anJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NDg0NTksImV4cCI6MjA5MzEyNDQ1OX0.rHfsDoZ6KZJKQtlsuZAHgWgho7S1frRslzYeAXTTrRA',
+  supabaseUrl:    'https://ptdjvmncxdndrhudijzq.supabase.co',
+  supabaseKey:    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB0ZGp2bW5jeGRuZHJodWRpanpxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMTQ5MzMsImV4cCI6MjA5MTg5MDkzM30.jc1sg6YlAI7VDhBHfBPopNGljkE0UroGklhwsv3FBps',
   // Pipefy token NÃO vai pro código — cada analista cola via tela "Configurar" (localStorage).
   pipefyToken:    '',
   // BMS = MongoDB Atlas (read-only). Browser NÃO conecta direto no Mongo.
   // bmsProxyPath aponta para uma Supabase Edge Function que faz o proxy seguro.
   bmsProxyPath:   '/functions/v1/bms-lookup',
+  // INPI: Edge Function inpi-search que raspa busca.inpi.gov.br do lado servidor (CORS bloqueado do browser)
+  inpiProxyPath:  '/functions/v1/inpi-search',
   gchatWebhook:   '',
   // Pipes (validados via API)
   pipeAtividades: 302656757, // "Atendimento - Atividades do Cliente"
@@ -455,6 +457,8 @@ const state = {
   search: '',
   faseFilter: '',
   solicitacaoFilter: '',
+  // cache de lookups INPI por marca (lowercase trim) durante a sessão
+  inpiCache: {},
 };
 
 let supa = null;
@@ -912,6 +916,48 @@ function persistCtrl(cardId, patch){
 /* ============================================================
    BMS API
    ============================================================ */
+// INPI via Edge Function inpi-search (raspa busca.inpi.gov.br server-side).
+// Cacheia por marca durante a sessão pra evitar chamadas duplicadas.
+async function fetchINPI(marca){
+  if (!marca) return null;
+  const key = marca.toLowerCase().trim();
+  // Hit no cache (mesmo se for objeto _loading, esperamos)
+  if (state.inpiCache[key]){
+    const cached = state.inpiCache[key];
+    if (cached._loading) return await cached._loading; // promise pendente
+    return cached;
+  }
+  if (!CONFIG.supabaseUrl?.startsWith('http') || !CONFIG.supabaseKey) return null;
+  const url = `${CONFIG.supabaseUrl.replace(/\/$/,'')}${CONFIG.inpiProxyPath||'/functions/v1/inpi-search'}`;
+
+  // Promise compartilhada para chamadas concorrentes da mesma marca
+  const p = (async () => {
+    try {
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'Authorization':'Bearer '+CONFIG.supabaseKey,
+          'apikey': CONFIG.supabaseKey,
+        },
+        body: JSON.stringify({ marca })
+      });
+      if (!res.ok){ return null; }
+      const data = await res.json();
+      state.inpiCache[key] = data;
+      return data;
+    } catch(e){
+      console.warn('fetchINPI falhou', e);
+      return null;
+    }
+  })();
+  state.inpiCache[key] = { _loading: p };
+  const result = await p;
+  if (result) state.inpiCache[key] = result;
+  else delete state.inpiCache[key];
+  return result;
+}
+
 async function fetchBMS(card){
   // BMS = MongoDB Atlas — acessado via Edge Function do Supabase (proxy seguro).
   // A function 'bms-lookup' precisa estar deployada. Ver supabase/functions/bms-lookup/index.ts
@@ -1022,71 +1068,88 @@ function calcularScore(bms, card, coments){
   return s;
 }
 
-// Etapa 4 — Árvore de Decisão (exata, conforme spec)
+// Etapa 4 — Árvore de Decisão.
+// REGRA: SEMPRE gerar o template do Apêndice apropriado pra fase. O score só
+// modula a recomendação do agente (sugerir NE x usar com cautela x whitelist).
+// O analista decide se envia.
 function decidirAcao(faseNE, score, bms, card, coments){
   const total = score.total;
   const top5 = (Number(bms?.posicao_ranking)||99) <= 5;
   const abertura = !!bms?.ciencia_negativacao;
   const autorizou = String(bms?.cliente_autorizou_envio||'').toLowerCase() === 'sim';
-  // Heurística: termo composto/genérico aumenta risco → precisa de dossiê
   const tipo_termo = (bms?.caracteristica_termo||'').toLowerCase();
   const precisaDossie = tipo_termo === 'composto' || tipo_termo === 'genérico' || tipo_termo === 'generico';
 
   if (faseNE === 'Fase 1'){
-    if (total < 11) return {
-      decisao: 'Não sugerir NE. Monitorar e verificar aumento de agressividade.',
-      apendice: null
-    };
-    // Score >= 11
-    if (top5 && abertura){
-      if (precisaDossie) return {
-        decisao: 'Solicitar elaboração do dossiê ao jurídico + acionar contraprova → Sugerir envio de NE Digital ao cliente.',
-        apendice: 'B'
-      };
+    // Sempre Apêndice B (Sugestão de NE Digital). Decisão varia pelo score.
+    if (total < 11){
       return {
-        decisao: 'Acionar contraprova → Sugerir envio de NE Digital ao cliente.',
-        apendice: 'B'
+        decisao: `Score ${total}/100 abaixo do limiar (11). Recomenda-se monitorar primeiro; o template anexo pode ser usado caso a equipe decida prosseguir mesmo assim ou em caso de revisão posterior do score.`,
+        apendice: 'B',
       };
     }
-    // Sem Top 5 ou sem comprovante de abertura
+    if (top5 && abertura){
+      if (precisaDossie) return {
+        decisao: `Score ${total}/100. Top 5 com abertura comprovada e termo ${tipo_termo} — solicitar dossiê ao jurídico + acionar contraprova → enviar NE Digital ao cliente.`,
+        apendice: 'B',
+      };
+      return {
+        decisao: `Score ${total}/100. Top 5 com abertura comprovada — acionar contraprova → enviar NE Digital ao cliente.`,
+        apendice: 'B',
+      };
+    }
     return {
-      decisao: 'Solicitar envio de comunicação via GreenSign para OPEC → Sugerir NE Digital ao cliente.',
-      apendice: 'B'
+      decisao: `Score ${total}/100. Sem Top 5 ou sem abertura comprovada — solicitar comunicação via GreenSign para OPEC → enviar NE Digital ao cliente.`,
+      apendice: 'B',
     };
   }
 
   if (faseNE === 'Fase 2'){
-    if (total < 13) return {
-      decisao: 'Analisar redução das ocorrências. Sugerir whitelist se agressividade baixou.',
-      apendice: 'F'
-    };
-    if (!autorizou) return {
-      decisao: 'Adicionar à whitelist até mudança de posicionamento (cliente não autorizou NE Física).',
-      apendice: 'F'
-    };
+    if (total < 13){
+      return {
+        decisao: `Score ${total}/100 abaixo do limiar (13). Sugerir whitelist se agressividade baixou; template de encerramento anexo.`,
+        apendice: 'F',
+      };
+    }
+    if (!autorizou){
+      return {
+        decisao: `Score ${total}/100. Cliente não autorizou NE Física — sugerir whitelist até mudança de posicionamento.`,
+        apendice: 'F',
+      };
+    }
     return {
-      decisao: 'Solicitar ao jurídico envio de NE por carta com AR → Informar cliente.',
-      apendice: 'C'
+      decisao: `Score ${total}/100. Cliente autorizou — solicitar ao jurídico envio de NE por carta com AR; template anexo informa o cliente.`,
+      apendice: 'C',
     };
   }
 
   if (faseNE === 'Fase 3'){
-    if (total < 15) return {
-      decisao: 'Analisar redução das ocorrências. Sugerir whitelist se agressividade baixou.',
-      apendice: 'F'
-    };
-    // Score >= 15 — litígio. Escolher D ou E pela via da NE anterior.
+    if (total < 15){
+      return {
+        decisao: `Score ${total}/100 abaixo do limiar (15) para litígio. Sugerir whitelist; template de encerramento anexo.`,
+        apendice: 'F',
+      };
+    }
     const comAll = (coments||[]).map(c=>(c.text||'').toLowerCase()).join('\n');
     const viaPFFA = /escrit[oó]rio parceiro|pffa|via escrit[oó]rio/.test(comAll);
     const viaInterna = /enviad[oa] internamente|envio interno|min[uú]ta interna/.test(comAll);
     if (viaInterna && !viaPFFA){
-      return { decisao: 'Sugerir litígio ao cliente — NE prévia enviada internamente; oferecer reenvio via escritório parceiro + jurídico interno.', apendice: 'E' };
+      return {
+        decisao: `Score ${total}/100. NE prévia enviada internamente — sugerir litígio; oferecer reenvio via escritório parceiro Branddi + jurídico interno.`,
+        apendice: 'E',
+      };
     }
-    // default → D (via PFFA / escritório parceiro)
-    return { decisao: 'Sugerir litígio ao cliente — NE prévia enviada via escritório parceiro; oferecer jurídico interno Branddi + continuidade com o parceiro.', apendice: 'D' };
+    return {
+      decisao: `Score ${total}/100. NE prévia via escritório parceiro — sugerir litígio; oferecer jurídico interno Branddi + continuidade com o parceiro.`,
+      apendice: 'D',
+    };
   }
 
-  return { decisao:'Sem decisão definida.', apendice:null };
+  // Fallback (não deveria atingir, mas se atingir, devolve template B com aviso)
+  return {
+    decisao: 'Fase do caso não identificada — usar template de Sugestão de NE como ponto de partida.',
+    apendice: 'B',
+  };
 }
 
 // Etapa 4 — Templates de e-mail (textos reais Apêndices B/C/D/E/F).
@@ -1242,11 +1305,26 @@ async function rodarAgenteNE(card){
   const coments = comentsRes.status==='fulfilled' ? comentsRes.value : [];
   const faseNE = identificarFase(coments);
 
-  // INPI: 1) manual do analista; 2) campo INPI nativo do Fluxo Clientes (cross-ref por nome); 3) null
+  // INPI: 1) manual do analista (override); 2) cross-ref do Fluxo Clientes; 3) Edge Function inpi-search; 4) null (mostra dropdown)
   const tituloKey = (card.titulo||'').toLowerCase().trim();
   let inpiStatus = state.neAnalises[card.id]?.inpi_status_manual
                 || state.clienteToInpi?.[tituloKey]
                 || null;
+  let inpiFonte = inpiStatus
+    ? (state.neAnalises[card.id]?.inpi_status_manual ? 'Manual (analista)' : 'Cadastro Fluxo Clientes')
+    : null;
+  if (!inpiStatus){
+    try {
+      const inpiRes = await fetchINPI(card.titulo);
+      if (inpiRes && !inpiRes.indisponivel){
+        inpiStatus = inpiRes.status;
+        inpiFonte = inpiRes.fonte || 'inpi-search';
+      } else if (inpiRes?.indisponivel){
+        inpiStatus = 'INPI indisponível';
+        inpiFonte = 'inpi-search (offline)';
+      }
+    } catch(e){ console.warn('Lookup INPI falhou:', e); }
+  }
 
   // Etapa 1 — Filtro Eliminatório
   let bloqueado = false, motivo = null;
@@ -1305,7 +1383,8 @@ async function rodarAgenteNE(card){
     card_id: card.id,
     fase_ne: faseNE,
     inpi_status: inpiStatus || 'Não localizado',
-    inpi_status_manual: inpiStatus, // preservar
+    inpi_status_manual: state.neAnalises[card.id]?.inpi_status_manual || null,
+    inpi_fonte: inpiFonte || null,
     bloqueado, motivo_bloqueio: motivo,
     score_json: score,
     pontos_atencao: pontos,
@@ -1904,15 +1983,21 @@ function renderNEPanel(card){
       el('div',{class:'val'},
         inpiSel,
         ' ',
-        el('button',{class:'btn sm', title:'Procedimento: Pesquisa por Marca → tipo Exata → digite a marca. Se exigir login, clique em "Continuar e efetue a pesquisa". Se fora do ar, tente emarcas.inpi.gov.br.', onclick:()=>{
+        el('button',{class:'btn sm', title:'Forçar nova busca automática via Edge Function inpi-search', onclick: async()=>{
+          const mk = (card.titulo||'').toLowerCase().trim();
+          delete state.inpiCache[mk];
+          delete state.neAnalises[card.id];
+          toast('Refazendo lookup INPI…');
+          await rodarAgenteNE(card);
+          const np = renderNEPanel(card);
+          panel.replaceWith(np);
+        }}, '🔎 Refazer INPI'),
+        ' ',
+        el('button',{class:'btn sm ghost', title:'Abrir busca.inpi.gov.br em nova aba (manual)', onclick:()=>{
           window.open('https://busca.inpi.gov.br/pePI/jsp/marcas/Pesquisa_classe_basica.jsp', '_blank');
           navigator.clipboard.writeText(card.titulo||'').catch(()=>{});
-          toast('Marca "'+(card.titulo||'')+'" copiada · pesquise como Exata', 'ok');
-        }}, '🔎 INPI'),
-        ' ',
-        el('button',{class:'btn sm ghost', title:'Buscador alternativo do INPI', onclick:()=>{
-          window.open('https://emarcas.inpi.gov.br/', '_blank');
-        }}, 'eMarcas')
+        }}, 'Abrir'),
+        a.inpi_fonte ? el('div',{style:{fontSize:'10px',color:'var(--text3)',marginTop:'2px',fontFamily:'var(--font)',fontWeight:'400'}}, a.inpi_fonte) : null
       )
     ),
     el('div',{class:'ne-stat score'},
